@@ -22,9 +22,11 @@ import {
   Camera,
   Copy,
   Check,
-  Download
+  Download,
+  Upload
 } from "lucide-react";
 import Button3D from "@/components/game/Button3D";
+import AssetPanel, { AssetItem } from "@/components/game/AssetPanel";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { AnimationMixer } from "three";
@@ -44,6 +46,14 @@ interface PlacedCharacter {
   rotationY: number;
   activeAnimName: string;
 }
+
+// Canvas sizing — responsive auto-fit + user zoom (square canvas, crisp re-render)
+const MIN_SIZE = 320;
+const MAX_SIZE = 3072;
+const ZOOM_MIN = 0.25;
+const ZOOM_MAX = 3;
+const CAPTURE_SIZE = 1536; // fixed render size for AI reference capture
+const clampNum = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 const MASCOTS = [
   { id: "character-a", name: "Blocky A", modelPath: "/blocky_characters/Models/GLB format/character-a.glb", previewPath: "/blocky_characters/Previews/character-a.png" },
@@ -137,6 +147,12 @@ export default function PlayerPage() {
   // Cache to store loaded GLB models dynamically to prevent network refetches
   const loadedModelsRef = useRef<{ [mascotId: string]: THREE.Group }>({});
 
+  // Dynamic registry for models from non-MASCOTS collections (id → { modelPath, name, previewPath? })
+  const dynamicRegistryRef = useRef<Record<string, { modelPath: string; name: string; previewPath?: string }>>({});
+
+  // Hidden file input used by the scene import (Load) button.
+  const importInputRef = useRef<HTMLInputElement>(null);
+
   // Cache to store loaded GLB animation clips per mascotId
   const loadedAnimsRef = useRef<{ [mascotId: string]: THREE.AnimationClip[] }>({});
 
@@ -153,10 +169,24 @@ export default function PlayerPage() {
   // Renderer ref for scene capture
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
 
+  // Camera orbit angle in degrees (45 = default NE isometric view)
+  const [cameraOrbitDeg, setCameraOrbitDeg] = useState(45);
+  const cameraOrbitDegRef = useRef(45);
+
+  // Canvas zoom + responsive fit. displaySize = fitSize * zoom (clamped).
+  const [zoom, setZoom] = useState(1);
+  const zoomRef = useRef(1);
+  const [fitSize, setFitSize] = useState(1024);
+  const playfieldRef = useRef<HTMLDivElement>(null);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const displaySize = Math.round(clampNum(fitSize * zoom, MIN_SIZE, MAX_SIZE));
+  const displaySizeRef = useRef(displaySize);
+
   // AI BG Gen state
   const [aiCaptureUrl, setAiCaptureUrl] = useState<string | null>(null);
   const [aiThemeText, setAiThemeText] = useState("");
   const [aiPromptCopied, setAiPromptCopied] = useState(false);
+  const [selectedAiStyle, setSelectedAiStyle] = useState("clay");
 
   // Bump animation when character hits a blocked tile
   const bumpAnimRef = useRef<{ charId: string; startTime: number; dx: number; dz: number } | null>(null);
@@ -199,6 +229,53 @@ export default function PlayerPage() {
   useEffect(() => {
     gridResolutionRef.current = gridResolution;
   }, [gridResolution]);
+
+  useEffect(() => {
+    cameraOrbitDegRef.current = cameraOrbitDeg;
+  }, [cameraOrbitDeg]);
+
+  useEffect(() => {
+    zoomRef.current = zoom;
+  }, [zoom]);
+
+  // Resize the renderer when the display size changes (square → no camera frustum change).
+  // Cheap: does not touch the scene graph, mixers, or characters.
+  useEffect(() => {
+    displaySizeRef.current = displaySize;
+    const r = rendererRef.current;
+    if (!r) return;
+    r.setSize(displaySize, displaySize);
+  }, [displaySize]);
+
+  // Responsive auto-fit: track available playfield area and keep canvas square-fit.
+  useEffect(() => {
+    const el = playfieldRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const PAD = 48; // matches container p-6 padding (24px each side)
+    // ResizeObserver fires an initial callback on observe(), so no synchronous measure needed.
+    const observer = new ResizeObserver(() => {
+      const avail = Math.min(el.clientWidth, el.clientHeight) - PAD;
+      const next = Math.round(clampNum(avail, MIN_SIZE, MAX_SIZE));
+      setFitSize(prev => (prev === next ? prev : next));
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  // Ctrl/Cmd + wheel (and trackpad pinch, which arrives as wheel+ctrlKey) over the
+  // canvas → zoom. Native non-passive listener so preventDefault works.
+  useEffect(() => {
+    const el = cardRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      const factor = Math.exp(-e.deltaY * 0.0015);
+      setZoom(z => clampNum(z * factor, ZOOM_MIN, ZOOM_MAX));
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
 
   useEffect(() => {
     gridVisibleRef.current = gridVisible;
@@ -262,7 +339,8 @@ export default function PlayerPage() {
     setActiveTab("grid");
   };
 
-  // Dynamic GLTF Loader to load any Blocky Character model by mascotId
+
+  // Dynamic GLTF Loader - works with both MASCOTS and dynamic registry
   const loadMascotModel = (mascotId: string, callback?: (model: THREE.Group) => void) => {
     if (loadedModelsRef.current[mascotId]) {
       if (callback) callback(loadedModelsRef.current[mascotId]);
@@ -270,11 +348,13 @@ export default function PlayerPage() {
     }
 
     const mascot = MASCOTS.find(m => m.id === mascotId);
-    if (!mascot) return;
+    const dynEntry = dynamicRegistryRef.current[mascotId];
+    const modelPath = mascot?.modelPath ?? dynEntry?.modelPath;
+    if (!modelPath) return;
 
     const loader = new GLTFLoader();
     loader.load(
-      mascot.modelPath,
+      modelPath,
       (gltf) => {
         const model = gltf.scene;
         // Enable shadows recursively on all meshes
@@ -300,6 +380,82 @@ export default function PlayerPage() {
         console.error(`Error loading GLB blocky character model ${mascotId}:`, err);
       }
     );
+  };
+
+  // ── Scene persistence (JSON export/import) ──────────────────────────
+  const SCENE_VERSION = 1;
+
+  const exportScene = () => {
+    // Only persist registry entries actually referenced by placed characters.
+    const usedRegistry: Record<string, { modelPath: string; name: string; previewPath?: string }> = {};
+    placedCharacters.forEach((c) => {
+      const entry = dynamicRegistryRef.current[c.mascotId];
+      if (entry) usedRegistry[c.mascotId] = entry;
+    });
+
+    const snapshot = {
+      version: SCENE_VERSION,
+      grid: {
+        pos: gridPos,
+        scale: gridScale,
+        opacity: gridOpacity,
+        resolution: gridResolution,
+        visible: gridVisible,
+      },
+      cameraOrbitDeg,
+      selectedBg,
+      placedCharacters,
+      blockedTiles: Array.from(blockedTiles),
+      registry: usedRegistry,
+    };
+
+    const blob = new Blob([JSON.stringify(snapshot, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "coder-studio-scene.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importScene = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const snap = JSON.parse(String(reader.result));
+        if (snap.version !== SCENE_VERSION) {
+          console.error(`Unsupported scene version: ${snap.version}`);
+          alert("ไฟล์ scene ไม่รองรับเวอร์ชันนี้");
+          return;
+        }
+
+        // Repopulate dynamic registry first so model paths resolve on load.
+        if (snap.registry) Object.assign(dynamicRegistryRef.current, snap.registry);
+
+        if (snap.grid) {
+          setGridPos(snap.grid.pos);
+          setGridScale(snap.grid.scale);
+          setGridOpacity(snap.grid.opacity);
+          setGridResolution(snap.grid.resolution);
+          setGridVisible(snap.grid.visible);
+        }
+        if (typeof snap.cameraOrbitDeg === "number") setCameraOrbitDeg(snap.cameraOrbitDeg);
+        if (snap.selectedBg) setSelectedBg(snap.selectedBg);
+        setBlockedTiles(new Set<string>(snap.blockedTiles ?? []));
+        setSelectedCharId(null);
+        setPlacedCharacters(snap.placedCharacters ?? []);
+
+        // Trigger GLB loading for every unique model referenced.
+        const ids = new Set<string>((snap.placedCharacters ?? []).map((c: PlacedCharacter) => c.mascotId));
+        ids.forEach((id) => loadMascotModel(id));
+      } catch (err) {
+        console.error("Failed to import scene:", err);
+        alert("ไม่สามารถอ่านไฟล์ scene ได้");
+      }
+    };
+    reader.readAsText(file);
   };
 
   // Pre-load default blocky characters on mount to guarantee instant interaction
@@ -462,8 +618,9 @@ export default function PlayerPage() {
   useEffect(() => {
     if (!mountRef.current) return;
 
-    const containerWidth = 1024;
-    const containerHeight = 1024;
+    // Initial size; the displaySize resize effect overrides this immediately after mount.
+    const containerWidth = displaySizeRef.current;
+    const containerHeight = displaySizeRef.current;
 
     // 1. Scene
     const scene = new THREE.Scene();
@@ -1275,6 +1432,16 @@ export default function PlayerPage() {
       // Update all active animation mixers
       Object.values(mixersRef.current).forEach(mixer => mixer.update(delta));
       
+      // Orbit camera around Y-axis (XZ radius = 12√2, height = 12)
+      const orbitRad = (cameraOrbitDegRef.current * Math.PI) / 180;
+      const XZ_RADIUS = 12 * Math.SQRT2;
+      cameraRef.current!.position.set(
+        XZ_RADIUS * Math.cos(orbitRad),
+        12,
+        XZ_RADIUS * Math.sin(orbitRad)
+      );
+      cameraRef.current!.lookAt(0, 0, 0);
+
       // Update Grid Board Position
       gridGroup.position.set(
         gridPosRef.current.x,
@@ -1590,6 +1757,7 @@ export default function PlayerPage() {
         });
         
         const markerGroup = new THREE.Group();
+        markerGroup.userData.directionMarker = true;
         markerGroup.position.set(d.x, 0.02, d.z); // Float slightly above tiles to prevent Z-fighting
         
         const plane = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 1.2), mat);
@@ -1924,67 +2092,173 @@ export default function PlayerPage() {
     if (panel === "grid") setActiveTab("grid");
     if (panel === "characters") setActiveTab("characters");
     if (panel === "tiles") setActiveTab("tiles");
+    // Leaving the Characters tab cancels any pending placement so the
+    // selection banner doesn't linger silently on other panels.
+    if (panel !== "characters") setSelectedMascot(null);
   };
+
+  const AI_STYLES = [
+    { key: "clay",       label: "3D Clay",
+      bg: "radial-gradient(ellipse at 35% 30%, #fff0e8, #ffd0b8 40%, #f0a888 70%, #e07860 100%)",
+      prompt: "An ultra-premium minimalist 3D clay render, smooth matte pastel finish, soft rounded shapes, warm studio lighting, clean elegant clay art style" },
+    { key: "cartoon",    label: "Cartoon",
+      bg: "linear-gradient(135deg, #ffe03d 0% 25%, #ff6eb4 25% 50%, #4fc3f7 50% 75%, #69f0ae 75% 100%)",
+      prompt: "Vibrant cartoon cel-shaded art style, bold outlines, bright saturated colors, playful toon shading, animated movie quality" },
+    { key: "cyberpunk",  label: "Cyberpunk",
+      bg: "repeating-linear-gradient(90deg, transparent 0px, transparent 19px, rgba(0,255,255,.18) 19px, rgba(0,255,255,.18) 20px), repeating-linear-gradient(180deg, transparent 0px, transparent 19px, rgba(180,0,255,.12) 19px, rgba(180,0,255,.12) 20px), linear-gradient(135deg, #040416, #0d0d2e)",
+      prompt: "Cyberpunk neon-lit cityscape, glowing neon signs, holographic elements, dark rainy atmosphere, purple and cyan neon glow, blade runner aesthetic" },
+    { key: "kawaii",     label: "Kawaii",
+      bg: "radial-gradient(circle at 15% 25%, #ff9ec4 0px, #ff9ec4 4px, transparent 4px) 0 0 / 20px 20px, radial-gradient(circle at 65% 75%, #cc88ee 0px, #cc88ee 3px, transparent 3px) 0 0 / 20px 20px, linear-gradient(135deg, #ffd6e8, #e8c8ff)",
+      prompt: "Ultra-cute kawaii Japanese style, pastel pink and lavender palette, soft chibi proportions, sparkles and flowers, adorable round shapes" },
+    { key: "darkfantasy",label: "Dark Fantasy",
+      bg: "radial-gradient(ellipse at 25% 40%, rgba(139,92,246,.55), transparent 50%), radial-gradient(ellipse at 75% 65%, rgba(76,29,149,.6), transparent 50%), linear-gradient(135deg, #0d0020, #1e0440)",
+      prompt: "Epic dark fantasy atmosphere, dramatic torchlight, ancient stone textures, mystical purple fog, gothic architectural details, moody shadows" },
+    { key: "pixel",      label: "Pixel Art",
+      bg: "repeating-linear-gradient(90deg, rgba(255,255,255,.07) 0px, rgba(255,255,255,.07) 1px, transparent 1px, transparent 10px), repeating-linear-gradient(180deg, rgba(255,255,255,.07) 0px, rgba(255,255,255,.07) 1px, transparent 1px, transparent 10px), linear-gradient(135deg, #0f0f23, #1a2a50)",
+      prompt: "Retro pixel art style, crisp 32-bit game aesthetic, limited color palette, clean pixel details, classic RPG game art" },
+    { key: "watercolor", label: "Watercolor",
+      bg: "radial-gradient(ellipse at 20% 30%, rgba(168,237,234,.7), transparent 45%), radial-gradient(ellipse at 80% 70%, rgba(254,214,227,.8), transparent 45%), radial-gradient(ellipse at 55% 55%, rgba(212,252,121,.45), transparent 50%), #d8eff5",
+      prompt: "Soft watercolor painting style, flowing ink washes, gentle color bleeds, artistic painted texture, impressionistic loose brushwork" },
+    { key: "steampunk",  label: "Steampunk",
+      bg: "radial-gradient(circle at 50% 50%, transparent 28px, rgba(200,136,42,.3) 28px, rgba(200,136,42,.3) 30px, transparent 30px) 0 0 / 60px 60px, radial-gradient(circle at 50% 50%, transparent 13px, rgba(200,136,42,.2) 13px, rgba(200,136,42,.2) 15px, transparent 15px) 0 0 / 60px 60px, linear-gradient(135deg, #2a1c10, #6b4010)",
+      prompt: "Victorian steampunk aesthetic, brass and copper machinery, steam pipes, cog gears, sepia warm tones, industrial elegance" },
+    { key: "enchanted",  label: "Enchanted",
+      bg: "radial-gradient(ellipse at 50% 40%, rgba(144,255,100,.35), transparent 55%), radial-gradient(ellipse at 20% 85%, rgba(80,220,60,.22), transparent 38%), linear-gradient(180deg, #021208, #063018, #0d4820)",
+      prompt: "Enchanted magical forest, bioluminescent glowing plants, fairy lights, mystical green glow, ancient mossy ruins, ethereal light shafts" },
+    { key: "neoncity",   label: "Neon City",
+      bg: "linear-gradient(180deg, rgba(255,80,200,.15) 0%, transparent 40%), linear-gradient(180deg, transparent 60%, rgba(0,229,255,.18) 100%), repeating-linear-gradient(90deg, transparent 0px, transparent 39px, rgba(255,80,200,.1) 39px, rgba(255,80,200,.1) 40px), linear-gradient(180deg, #06040e, #100820)",
+      prompt: "Vibrant neon city night scene, glowing neon signs in multiple colors, wet reflective streets, urban cyberpunk environment, electric atmosphere" },
+    { key: "egypt",      label: "Ancient Egypt",
+      bg: "repeating-linear-gradient(180deg, transparent 0px, transparent 9px, rgba(200,169,81,.18) 9px, rgba(200,169,81,.18) 10px), linear-gradient(135deg, #5c3d00, #c8951a, #f5d060, #c8951a, #5c3d00)",
+      prompt: "Ancient Egyptian setting, golden sandstone textures, hieroglyphic carvings, warm desert sunlight, palm trees, lapis lazuli accents" },
+    { key: "underwater", label: "Underwater",
+      bg: "repeating-linear-gradient(180deg, transparent 0px, transparent 14px, rgba(144,224,239,.18) 14px, rgba(144,224,239,.18) 16px), radial-gradient(ellipse at 50% 0%, rgba(224,242,255,.4), transparent 60%), linear-gradient(180deg, #0050a0, #0077c8, #00a8e0)",
+      prompt: "Magical underwater ocean environment, caustic light patterns, coral reefs, floating kelp, soft aqua blue atmosphere, bioluminescent details" },
+    { key: "space",      label: "Space Station",
+      bg: "radial-gradient(circle at 15% 25%, white 0px, white 1.5px, transparent 1.5px) 0 0 / 30px 30px, radial-gradient(circle at 70% 60%, white 0px, white 1px, transparent 1px) 0 0 / 50px 50px, radial-gradient(circle at 45% 80%, white 0px, white 1px, transparent 1px) 0 0 / 20px 20px, linear-gradient(135deg, #030308, #0a0a20)",
+      prompt: "Futuristic space station interior, metallic hull panels, zero-gravity sci-fi environment, deep space backdrop with stars, blue sci-fi lighting" },
+    { key: "viking",     label: "Viking",
+      bg: "repeating-linear-gradient(135deg, transparent 0px, transparent 14px, rgba(160,196,200,.14) 14px, rgba(160,196,200,.14) 15px), linear-gradient(180deg, #0c2030, #1e4060, #2a5570, #608898)",
+      prompt: "Norse Viking era setting, rough-hewn timber halls, rune carvings, cold misty fjord atmosphere, firelight warmth against icy blues" },
+    { key: "tropical",   label: "Tropical",
+      bg: "radial-gradient(ellipse at 50% 100%, rgba(255,234,0,.55), transparent 50%), radial-gradient(ellipse at 50% 10%, rgba(0,200,81,.5), transparent 50%), linear-gradient(180deg, #00a040, #50c830, #ffd000)",
+      prompt: "Lush tropical paradise, vibrant jungle foliage, exotic flowers, bright golden sunlight, thatched huts, turquoise water in the distance" },
+    { key: "desert",     label: "Desert Ruins",
+      bg: "repeating-linear-gradient(160deg, transparent 0px, transparent 24px, rgba(180,130,40,.12) 24px, rgba(180,130,40,.12) 25px), linear-gradient(180deg, #c8956a, #e8bf80, #d4a060, #8b5020)",
+      prompt: "Ancient desert ruins, sun-bleached sandstone, crumbling columns, heat shimmer, wind-worn textures, warm amber and ochre tones, sand dunes" },
+    { key: "winter",     label: "Winter",
+      bg: "radial-gradient(circle at 20% 30%, white 0px, white 2px, transparent 2px) 0 0 / 22px 22px, radial-gradient(circle at 70% 70%, rgba(255,255,255,.7) 0px, rgba(255,255,255,.7) 1.5px, transparent 1.5px) 0 0 / 18px 18px, linear-gradient(180deg, #c8e8ff, #e8f4ff, #d8eeff)",
+      prompt: "Magical winter wonderland, pristine snow covering every surface, icicles, soft blue-white light, frosted trees, cozy glowing warm windows" },
+    { key: "volcanic",   label: "Volcanic",
+      bg: "radial-gradient(ellipse at 50% 85%, rgba(255,100,0,.65), transparent 50%), radial-gradient(ellipse at 25% 90%, rgba(255,50,0,.4), transparent 38%), linear-gradient(180deg, #080000, #220006, #500010)",
+      prompt: "Dramatic volcanic environment, glowing lava rivers, ash-covered ground, dramatic orange and red lighting, ember particles, intense heat haze" },
+    { key: "fairytale",  label: "Fairy Tale",
+      bg: "radial-gradient(circle at 20% 30%, rgba(255,180,230,.7) 0px, rgba(255,180,230,.7) 3px, transparent 3px) 0 0 / 22px 22px, radial-gradient(circle at 70% 70%, rgba(190,160,255,.55) 0px, rgba(190,160,255,.55) 2px, transparent 2px) 0 0 / 16px 16px, linear-gradient(135deg, #ffd6f0, #e8c8ff, #ffeef8)",
+      prompt: "Whimsical fairy tale kingdom, pastel candy-colored architecture, sparkle magic effects, fluffy clouds, rainbow reflections, storybook illustration style" },
+    { key: "mecha",      label: "Mecha / Sci-Fi",
+      bg: "repeating-linear-gradient(90deg, transparent 0px, transparent 19px, rgba(0,212,255,.13) 19px, rgba(0,212,255,.13) 20px), repeating-linear-gradient(180deg, transparent 0px, transparent 19px, rgba(0,212,255,.08) 19px, rgba(0,212,255,.08) 20px), linear-gradient(135deg, #060c14, #0a1828)",
+      prompt: "Futuristic mecha sci-fi environment, chrome and titanium surfaces, glowing energy conduits, holographic HUD elements, clean high-tech industrial design" },
+  ] as const;
+  type AiStyleKey = typeof AI_STYLES[number]["key"];
 
   const captureScene = () => {
     const renderer = rendererRef.current;
-    const mountEl = mountRef.current;
-    if (!renderer || !mountEl) return;
+    const gridGroup = gridGroupRef.current;
+    const matA = tileMatARef.current;
+    const matB = tileMatBRef.current;
+    const matBottom = tileBottomMatRef.current;
+    const lineMat = lineMatRef.current;
+    if (!renderer || !gridGroup) return;
 
-    const threeCanvas = renderer.domElement;
-    const w = threeCanvas.width;
-    const h = threeCanvas.height;
+    // --- 1. Save state ---
+    const savedOpacityA = matA?.opacity ?? 0;
+    const savedOpacityB = matB?.opacity ?? 0;
+    const savedOpacityBottom = matBottom?.opacity ?? 0;
+    const savedOpacityLine = lineMat?.opacity ?? 0;
 
-    const compositeCanvas = document.createElement("canvas");
-    compositeCanvas.width = w;
-    compositeCanvas.height = h;
-    const ctx = compositeCanvas.getContext("2d");
-    if (!ctx) return;
+    const dirMarkers: THREE.Object3D[] = [];
+    gridGroup.traverse(obj => {
+      if (obj.userData.directionMarker) dirMarkers.push(obj);
+    });
 
-    // Draw background
-    if (selectedBg === "custom" && uploadedBgUrl) {
-      const img = new window.Image();
-      img.onload = () => {
-        ctx.drawImage(img, 0, 0, w, h);
+    // --- 2. Apply capture overrides ---
+    // Hide direction arrows
+    dirMarkers.forEach(m => { m.visible = false; });
+    // Drop grid to barely-visible opacity (enough for AI to see structure, invisible to human eye)
+    const CAPTURE_OPACITY = 0.04;
+    if (matA) { matA.opacity = CAPTURE_OPACITY; matA.needsUpdate = true; }
+    if (matB) { matB.opacity = CAPTURE_OPACITY * 0.8; matB.needsUpdate = true; }
+    if (matBottom) { matBottom.opacity = CAPTURE_OPACITY * 0.5; matBottom.needsUpdate = true; }
+    if (lineMat) { lineMat.opacity = CAPTURE_OPACITY * 0.5; lineMat.needsUpdate = true; }
+    // Render at a fixed high resolution so the AI reference is consistent regardless of zoom.
+    renderer.setSize(CAPTURE_SIZE, CAPTURE_SIZE);
+
+    // --- 3. Wait 2 frames so render loop paints the change ---
+    const doCapture = () => {
+      const threeCanvas = renderer.domElement;
+      const w = threeCanvas.width;
+      const h = threeCanvas.height;
+
+      const compositeCanvas = document.createElement("canvas");
+      compositeCanvas.width = w;
+      compositeCanvas.height = h;
+      const ctx = compositeCanvas.getContext("2d");
+
+      const finalize = () => {
+        // --- 4. Restore state ---
+        dirMarkers.forEach(m => { m.visible = true; });
+        if (matA) { matA.opacity = savedOpacityA; matA.needsUpdate = true; }
+        if (matB) { matB.opacity = savedOpacityB; matB.needsUpdate = true; }
+        if (matBottom) { matBottom.opacity = savedOpacityBottom; matBottom.needsUpdate = true; }
+        if (lineMat) { lineMat.opacity = savedOpacityLine; lineMat.needsUpdate = true; }
+        // Restore the on-screen display size.
+        renderer.setSize(displaySizeRef.current, displaySizeRef.current);
+      };
+
+      if (!ctx) { finalize(); return; }
+
+      const drawAndSave = () => {
         ctx.drawImage(threeCanvas, 0, 0);
         setAiCaptureUrl(compositeCanvas.toDataURL("image/png"));
+        finalize();
       };
-      img.src = uploadedBgUrl;
-    } else {
-      const bgOpt = BG_OPTIONS.find(b => b.key === selectedBg);
-      const bgStyle = bgOpt?.style ?? BG_OPTIONS[0].style;
-      if ("background" in bgStyle) {
-        const bg = bgStyle.background as string;
-        if (bg.startsWith("linear-gradient")) {
-          // Parse gradient stops and approximate as top→bottom
-          const stops = [...bg.matchAll(/#[0-9a-fA-F]{3,8}|rgba?\([^)]+\)/g)].map(m => m[0]);
-          if (stops.length >= 2) {
-            const grad = ctx.createLinearGradient(0, 0, 0, h);
-            stops.forEach((c, i) => grad.addColorStop(i / (stops.length - 1), c));
-            ctx.fillStyle = grad;
+
+      if (selectedBg === "custom" && uploadedBgUrl) {
+        const img = new window.Image();
+        img.onload = () => { ctx.drawImage(img, 0, 0, w, h); drawAndSave(); };
+        img.onerror = drawAndSave;
+        img.src = uploadedBgUrl;
+      } else {
+        const bgOpt = BG_OPTIONS.find(b => b.key === selectedBg);
+        const bgStyle = bgOpt?.style ?? BG_OPTIONS[0].style;
+        if ("background" in bgStyle) {
+          const bg = bgStyle.background as string;
+          if (bg.startsWith("linear-gradient")) {
+            const stops = [...bg.matchAll(/#[0-9a-fA-F]{3,8}|rgba?\([^)]+\)/g)].map(m => m[0]);
+            if (stops.length >= 2) {
+              const grad = ctx.createLinearGradient(0, 0, 0, h);
+              stops.forEach((c, i) => grad.addColorStop(i / (stops.length - 1), c));
+              ctx.fillStyle = grad;
+            } else {
+              ctx.fillStyle = stops[0] ?? "#1e1e2e";
+            }
           } else {
-            ctx.fillStyle = stops[0] ?? "#1e1e2e";
+            ctx.fillStyle = bg;
           }
-        } else {
-          ctx.fillStyle = bg;
+          ctx.fillRect(0, 0, w, h);
         }
-        ctx.fillRect(0, 0, w, h);
+        drawAndSave();
       }
-      ctx.drawImage(threeCanvas, 0, 0);
-      setAiCaptureUrl(compositeCanvas.toDataURL("image/png"));
-    }
+    };
+
+    // Skip 2 animation frames so the rAF render loop has a chance to paint
+    requestAnimationFrame(() => requestAnimationFrame(doCapture));
   };
 
   const buildAiPrompt = () => {
-    const detail = aiThemeText.trim() || "(ใส่ theme ที่ต้องการ เช่น ninja village in Japan at night)";
-    return `[RULES]
-• Style: Isometric 2.5D game background, 45° orthographic perspective
-• Output size: 2048 × 2048 pixels
-• The reference image shows exact placement of characters, props, and walls — preserve ALL of them; do NOT remove, move, or replace any element
-• Enhance ONLY the environment: textures, lighting, atmosphere, color grading, vegetation, and decorative details
-• Add richness and depth to floors, walls, and surroundings while matching the isometric composition of the reference exactly
-• Art style: stylized 3D game art (not pixel art, not photorealistic)
-• Keep the same camera angle and perspective as the reference image
+    const styleObj = AI_STYLES.find(s => s.key === selectedAiStyle) ?? AI_STYLES[0];
+    const detail = aiThemeText.trim() || "(ใส่ theme / สถานที่ที่ต้องการ)";
+    return `${styleObj.prompt}, isometric 2.5D game background, 45° orthographic top-down perspective, output size 2048 × 2048 pixels, all props characters and objects in the scene must use a Kenney-style design: clean simple low-poly 3D models with flat colors minimal detail rounded friendly shapes similar to Kenney game assets, the reference image shows the exact placement of characters props and walls — preserve ALL of them do NOT remove move or replace any element, enhance ONLY the environment textures lighting atmosphere color grading vegetation and decorative details while keeping all props in Kenney-style, add richness and depth to floors walls and surroundings while matching the isometric composition of the reference exactly, keep the same camera angle and perspective as the reference image --ar 1:1 --q 2
 
 [THEME / DETAIL]
 ${detail}`;
@@ -2124,6 +2398,36 @@ ${detail}`;
           </h1>
         </div>
 
+        <div className="flex items-center gap-2">
+        {/* Scene persistence: Save / Load */}
+        <button
+          onClick={exportScene}
+          className="h-10 px-3 rounded-xl bg-white dark:bg-slate-800 border-2 border-b-[4px] border-slate-200 dark:border-slate-700 flex items-center gap-1.5 text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-700 active:border-b-[2px] active:translate-y-[2px] transition-all duration-100 cursor-pointer shadow-sm text-xs font-bold"
+          title="บันทึก scene เป็นไฟล์ JSON"
+        >
+          <Download className="w-4 h-4" />
+          <span>Save</span>
+        </button>
+        <button
+          onClick={() => importInputRef.current?.click()}
+          className="h-10 px-3 rounded-xl bg-white dark:bg-slate-800 border-2 border-b-[4px] border-slate-200 dark:border-slate-700 flex items-center gap-1.5 text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-700 active:border-b-[2px] active:translate-y-[2px] transition-all duration-100 cursor-pointer shadow-sm text-xs font-bold"
+          title="โหลด scene จากไฟล์ JSON"
+        >
+          <Upload className="w-4 h-4" />
+          <span>Load</span>
+        </button>
+        <input
+          ref={importInputRef}
+          type="file"
+          accept="application/json"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) importScene(file);
+            e.target.value = "";
+          }}
+        />
+
         {/* Theme Switcher Toggle */}
         <button
           onClick={toggleTheme}
@@ -2136,10 +2440,14 @@ ${detail}`;
             <Moon className="w-5 h-5 text-brand-blue" />
           )}
         </button>
+        </div>
       </header>
 
+      {/* Wrapper: middle row + bottom AssetPanel */}
+      <div className="flex-1 flex flex-col overflow-hidden select-none">
+
       {/* Main Container - Left Sidebar + Centered 1024x1024px Canvas */}
-      <main className="flex-1 w-full flex flex-col lg:flex-row items-stretch select-none overflow-hidden">
+      <main className="flex-1 w-full flex flex-col lg:flex-row items-stretch overflow-hidden">
 
         {/* ── Left Inspector Panel — Vertical Tabs ── */}
         <aside className="w-80 shrink-0 flex flex-row bg-white dark:bg-[#1e1e1e] border-r border-slate-200 dark:border-[#333] overflow-hidden text-[11px] font-mono select-none">
@@ -2237,6 +2545,33 @@ ${detail}`;
                   </div>
 
                   <div className="flex items-center gap-2 px-3 py-1.5 border-b border-slate-100 dark:border-[#2a2a2a]">
+                    <span className="text-blue-500 dark:text-[#9cdcfe] w-20 shrink-0">Orbit °</span>
+                    <input type="range" min="0" max="360" step="1" value={cameraOrbitDeg}
+                      onChange={e => setCameraOrbitDeg(parseInt(e.target.value))}
+                      className="flex-1 accent-brand-blue dark:accent-[#569cd6] h-1 cursor-pointer" />
+                    <input type="number" min="0" max="360" step="1" value={cameraOrbitDeg}
+                      onChange={e => { const v = parseInt(e.target.value); if (!isNaN(v)) setCameraOrbitDeg(((v % 360) + 360) % 360); }}
+                      className="w-10 bg-transparent border-b border-slate-200 dark:border-[#444] text-right text-slate-700 dark:text-[#d4d4d4] tabular-nums outline-none focus:border-brand-blue dark:focus:border-[#569cd6] [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none" />
+                  </div>
+                  {/* Snap preset buttons */}
+                  <div className="flex gap-1 px-3 pb-1.5 border-b border-slate-100 dark:border-[#2a2a2a]">
+                    {[
+                      { label: "NE",  deg: 45  },
+                      { label: "SE",  deg: 135 },
+                      { label: "SW",  deg: 225 },
+                      { label: "NW",  deg: 315 },
+                    ].map(snap => (
+                      <button key={snap.deg} onClick={() => setCameraOrbitDeg(snap.deg)}
+                        className={`flex-1 py-1 rounded text-[8px] font-bold transition-colors cursor-pointer ${
+                          cameraOrbitDeg === snap.deg
+                            ? "bg-brand-blue dark:bg-[#569cd6] text-white"
+                            : "bg-slate-100 dark:bg-[#2a2a2a] text-slate-500 dark:text-[#888] hover:bg-slate-200 dark:hover:bg-[#333]"
+                        }`}
+                      >{snap.label}</button>
+                    ))}
+                  </div>
+
+                  <div className="flex items-center gap-2 px-3 py-1.5 border-b border-slate-100 dark:border-[#2a2a2a]">
                     <span className="text-blue-500 dark:text-[#9cdcfe] w-20 shrink-0">Size</span>
                     <input type="range" min="3" max="50" step="1" value={gridResolution}
                       onChange={e => setGridResolution(parseInt(e.target.value))}
@@ -2244,6 +2579,19 @@ ${detail}`;
                     <input type="number" min="3" max="50" step="1" value={gridResolution}
                       onChange={e => { const v = parseInt(e.target.value); if (!isNaN(v)) setGridResolution(Math.min(50, Math.max(3, v))); }}
                       className="w-10 bg-transparent border-b border-slate-200 dark:border-[#444] text-right text-slate-700 dark:text-[#d4d4d4] tabular-nums outline-none focus:border-brand-blue dark:focus:border-[#569cd6] [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none" />
+                  </div>
+
+                  <div className="flex items-center gap-2 px-3 py-1.5 border-b border-slate-100 dark:border-[#2a2a2a]">
+                    <span className="text-blue-500 dark:text-[#9cdcfe] w-20 shrink-0">Zoom</span>
+                    <input type="range" min={ZOOM_MIN} max={ZOOM_MAX} step="0.05" value={zoom}
+                      onChange={e => setZoom(clampNum(parseFloat(e.target.value), ZOOM_MIN, ZOOM_MAX))}
+                      className="flex-1 accent-brand-blue dark:accent-[#569cd6] h-1 cursor-pointer" />
+                    <span className="w-10 text-right text-slate-700 dark:text-[#d4d4d4] tabular-nums">{Math.round(zoom * 100)}%</span>
+                  </div>
+                  <div className="flex gap-1 px-3 pb-1.5 border-b border-slate-100 dark:border-[#2a2a2a]">
+                    <button onClick={() => setZoom(1)}
+                      className="flex-1 py-1 rounded text-[8px] font-bold transition-colors cursor-pointer bg-slate-100 dark:bg-[#2a2a2a] text-slate-500 dark:text-[#888] hover:bg-slate-200 dark:hover:bg-[#333]"
+                    >Reset 100%</button>
                   </div>
 
                   <div className="px-2 py-1 bg-slate-100 dark:bg-[#252525] border-b border-slate-200 dark:border-[#333] text-slate-400 dark:text-[#888] text-[9px] uppercase tracking-widest font-bold mt-1">
@@ -2265,44 +2613,15 @@ ${detail}`;
               {/* ── CHARACTERS PANEL ── */}
               {activePanel === "characters" && (
                 <>
-                  <div className="px-2 py-1 bg-slate-100 dark:bg-[#252525] border-b border-slate-200 dark:border-[#333] text-slate-400 dark:text-[#888] text-[9px] uppercase tracking-widest font-bold flex items-center justify-between">
-                    <span>Models ({MASCOTS.length})</span>
-                    {selectedMascot && (
-                      <button onClick={() => setSelectedMascot(null)} className="text-red-400 hover:text-red-500 dark:text-[#f47067] dark:hover:text-red-400 text-[9px] cursor-pointer">✕ Cancel</button>
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-4 gap-1 p-2 border-b border-slate-200 dark:border-[#333]">
-                    {MASCOTS.map(mascot => {
-                      const isLoaded = loadedMascotIds.includes(mascot.id);
-                      const isSelected = selectedMascot === mascot.id;
-                      return (
-                        <button
-                          key={mascot.id}
-                          onClick={() => { setSelectedMascot(isSelected ? null : mascot.id); switchPanel("characters"); }}
-                          title={mascot.name}
-                          className={`relative flex flex-col items-center p-1 rounded-lg border transition-all cursor-pointer ${
-                            isSelected
-                              ? "border-brand-blue dark:border-[#569cd6] bg-blue-50 dark:bg-[#1a3a5a]"
-                              : "border-slate-200 dark:border-[#333] hover:border-slate-300 dark:hover:border-[#555] bg-slate-50 dark:bg-[#252525] hover:bg-slate-100 dark:hover:bg-[#2e2e2e]"
-                          }`}
-                        >
-                          <img src={mascot.previewPath} alt={mascot.name} className="w-8 h-8 object-contain" />
-                          <span className="text-[7px] text-slate-400 dark:text-[#888] truncate w-full text-center mt-0.5">{mascot.name.replace("Blocky ", "")}</span>
-                          {!isLoaded && (
-                            <div className="absolute inset-0 bg-black/30 dark:bg-black/50 rounded-lg flex items-center justify-center">
-                              <span className="text-[7px] text-slate-500 dark:text-[#888]">…</span>
-                            </div>
-                          )}
-                          {isSelected && <div className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-brand-blue dark:bg-[#569cd6]" />}
-                        </button>
-                      );
-                    })}
-                  </div>
-
                   {selectedMascot && (
-                    <div className="mx-2 my-1.5 px-2 py-1.5 rounded-lg bg-blue-50 dark:bg-[#1a3a5a] border border-blue-200 dark:border-[#2a5a8a] text-brand-blue dark:text-[#569cd6] text-[9px] font-bold text-center animate-pulse">
-                      Click grid tile to place
+                    <div className="mx-2 my-2 px-2 py-1.5 rounded-lg bg-blue-50 dark:bg-[#1a3a5a] border border-blue-200 dark:border-[#2a5a8a] text-brand-blue dark:text-[#569cd6] text-[9px] font-bold flex items-center gap-2 animate-pulse">
+                      <span className="flex-1">คลิก tile บน grid เพื่อวาง</span>
+                      <button onClick={() => setSelectedMascot(null)} className="text-red-400 hover:text-red-500 text-[9px] cursor-pointer font-bold shrink-0">x</button>
+                    </div>
+                  )}
+                  {!selectedMascot && !selectedChar && (
+                    <div className="px-3 py-4 text-center text-slate-400 dark:text-[#555] text-[9px]">
+                      เลือก model จาก Asset Panel ด้านล่าง
                     </div>
                   )}
 
@@ -2311,12 +2630,14 @@ ${detail}`;
                   </div>
 
                   {selectedChar ? (() => {
-                    const info = MASCOTS.find(m => m.id === selectedChar.mascotId);
+                    const staticInfo = MASCOTS.find(m => m.id === selectedChar.mascotId);
+                    const dynInfo = dynamicRegistryRef.current[selectedChar.mascotId];
+                    const info = staticInfo ?? (dynInfo ? { name: dynInfo.name, previewPath: dynInfo.previewPath } : null);
                     return (
                       <div className="flex flex-col">
                         <div className="flex items-center gap-2 px-3 py-2 border-b border-slate-100 dark:border-[#2a2a2a]">
-                          {info && <img src={info.previewPath} alt={info.name} className="w-5 h-5 object-contain" />}
-                          <span className="text-slate-700 dark:text-[#d4d4d4] font-bold truncate">{info?.name || "Character"}</span>
+                          {info?.previewPath && <img src={info.previewPath} alt={info.name} className="w-5 h-5 object-contain" />}
+                          <span className="text-slate-700 dark:text-[#d4d4d4] font-bold truncate text-[9px]">{info?.name || selectedChar.mascotId.split(":").pop() || "Model"}</span>
                         </div>
                         <div className="flex items-center gap-2 px-3 py-1.5 border-b border-slate-100 dark:border-[#2a2a2a]">
                           <span className="text-blue-500 dark:text-[#9cdcfe] w-14 shrink-0">Scale</span>
@@ -2401,7 +2722,7 @@ ${detail}`;
                         <button
                           onClick={() => { setPlacedCharacters(prev => prev.filter(c => c.id !== selectedCharId)); setSelectedCharId(null); }}
                           className="mx-3 my-2 py-1.5 rounded-lg bg-red-50 dark:bg-[#3a1a1a] hover:bg-red-100 dark:hover:bg-[#4a2020] border border-red-200 dark:border-[#5a2020] text-red-500 dark:text-[#f47067] text-[9px] font-bold uppercase tracking-wider transition-colors cursor-pointer"
-                        >✕ Remove</button>
+                        >Remove</button>
                       </div>
                     );
                   })() : (
@@ -2415,7 +2736,10 @@ ${detail}`;
                       </div>
                       <div className="overflow-y-auto">
                         {placedCharacters.map((char, i) => {
-                          const info = MASCOTS.find(m => m.id === char.mascotId);
+                          const sInfo = MASCOTS.find(m => m.id === char.mascotId);
+                          const dInfo = dynamicRegistryRef.current[char.mascotId];
+                          const previewPath = sInfo?.previewPath ?? dInfo?.previewPath;
+                          const modelName = sInfo?.name ?? dInfo?.name ?? char.mascotId.split(":").pop() ?? "Model";
                           return (
                             <div key={char.id} onClick={() => setSelectedCharId(char.id)}
                               className={`flex items-center gap-2 px-3 py-1.5 border-b border-slate-100 dark:border-[#2a2a2a] cursor-pointer transition-colors ${
@@ -2424,13 +2748,13 @@ ${detail}`;
                                   : "hover:bg-slate-50 dark:hover:bg-[#252525] text-slate-400 dark:text-[#888]"
                               }`}
                             >
-                              {info && <img src={info.previewPath} alt="" className="w-4 h-4 object-contain shrink-0" />}
-                              <span className="flex-1 truncate text-[9px]">{info?.name.replace("Blocky ", "") || "?"} #{i + 1}</span>
+                              {previewPath && <img src={previewPath} alt="" className="w-4 h-4 object-contain shrink-0" />}
+                              <span className="flex-1 truncate text-[9px]">{modelName.replace("Blocky ", "")} #{i + 1}</span>
                               <span className="text-[8px] tabular-nums opacity-60">{char.gridX},{char.gridZ}</span>
                               <button
                                 onClick={e => { e.stopPropagation(); setPlacedCharacters(prev => prev.filter(c => c.id !== char.id)); if (selectedCharId === char.id) setSelectedCharId(null); }}
                                 className="text-red-400 dark:text-[#f47067] hover:text-red-500 text-[8px] ml-1 cursor-pointer"
-                              >✕</button>
+                              >x</button>
                             </div>
                           );
                         })}
@@ -2494,7 +2818,7 @@ ${detail}`;
                         onClick={() => setBlockedTiles(new Set())}
                         className="mx-3 mt-2 py-1.5 rounded-lg bg-red-50 dark:bg-[#3a1a1a] hover:bg-red-100 dark:hover:bg-[#4a2020] border border-red-200 dark:border-[#5a2020] text-red-500 dark:text-[#f47067] text-[9px] font-bold uppercase tracking-wider transition-colors cursor-pointer"
                       >
-                        ✕ Clear ทั้งหมด
+                        Clear ทั้งหมด
                       </button>
 
                       <div className="px-2 py-1 bg-slate-100 dark:bg-[#252525] border-y border-slate-200 dark:border-[#333] text-slate-400 dark:text-[#888] text-[9px] uppercase tracking-widest font-bold mt-2">
@@ -2511,7 +2835,7 @@ ${detail}`;
                               <button
                                 onClick={() => setBlockedTiles(prev => { const n = new Set(prev); n.delete(key); return n; })}
                                 className="text-red-400 dark:text-[#f47067] hover:text-red-500 text-[8px] opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
-                              >✕</button>
+                              >x</button>
                             </div>
                           );
                         })}
@@ -2543,7 +2867,7 @@ ${detail}`;
                         <button
                           onClick={() => { setSelectedBg("playground"); setUploadedBgUrl(null); }}
                           className="absolute top-0.5 right-0.5 w-4 h-4 rounded bg-black/50 text-white text-[8px] flex items-center justify-center hover:bg-black/70 cursor-pointer"
-                        >✕</button>
+                        >x</button>
                       </div>
                     )}
                   </div>
@@ -2595,37 +2919,91 @@ ${detail}`;
                         >
                           <Download className="w-3 h-3" />
                         </a>
-                        <span className="absolute top-1 left-1 bg-green-500 text-white text-[7px] font-bold px-1.5 py-0.5 rounded-full">✓ captured</span>
+                        <span className="absolute top-1 left-1 bg-green-500 text-white text-[7px] font-bold px-1.5 py-0.5 rounded-full">captured</span>
                       </div>
                     )}
                   </div>
 
-                  {/* Step 2 — Theme */}
+                  {/* Step 2 — Art Style */}
                   <div className="px-2 pt-1 pb-1 bg-slate-50 dark:bg-[#252525] border-y border-slate-200 dark:border-[#333]">
-                    <span className="text-[8px] font-bold uppercase tracking-widest text-slate-400 dark:text-[#666]">ขั้นตอนที่ 2 — ใส่ Theme / Detail</span>
+                    <span className="text-[8px] font-bold uppercase tracking-widest text-slate-400 dark:text-[#666]">
+                      2 — Art Style (20 แบบ)
+                    </span>
+                  </div>
+                  <div className="p-2 grid grid-cols-2 gap-2">
+                    {AI_STYLES.map((style) => {
+                      const isSelected = selectedAiStyle === style.key;
+                      return (
+                        <button
+                          key={style.key}
+                          onClick={() => setSelectedAiStyle(style.key)}
+                          title={style.label}
+                          className={`relative flex flex-col items-center rounded-lg overflow-hidden border-2 transition-all cursor-pointer ${
+                            isSelected
+                              ? "border-brand-blue dark:border-[#569cd6] shadow-md scale-[1.05]"
+                              : "border-transparent hover:border-slate-300 dark:hover:border-[#555]"
+                          }`}
+                        >
+                          <div
+                            className="w-full h-16 rounded-t"
+                            style={{ background: style.bg }}
+                          />
+                          <div
+                            className={`w-full text-center py-0.5 text-[7px] font-bold leading-tight truncate px-0.5 ${
+                              isSelected
+                                ? "bg-brand-blue dark:bg-[#569cd6] text-white"
+                                : "bg-slate-100 dark:bg-[#2a2a2a] text-slate-500 dark:text-[#888]"
+                            }`}
+                          >
+                            {style.label}
+                          </div>
+                          {isSelected && (
+                            <span className="absolute top-0.5 right-0.5 w-3 h-3 bg-brand-blue dark:bg-[#569cd6] rounded-full flex items-center justify-center">
+                              <Check className="w-2 h-2 text-white" />
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Selected style description */}
+                  {(() => {
+                    const s = AI_STYLES.find((s) => s.key === selectedAiStyle);
+                    return s ? (
+                      <div className="mx-2 mb-1.5 p-2 rounded-lg border border-slate-200 dark:border-[#333] bg-slate-50 dark:bg-[#1e1e1e]">
+                        <p className="text-[8px] font-bold text-slate-600 dark:text-[#c8c8c8] mb-0.5">{s.label}</p>
+                        <p className="text-[8px] text-slate-500 dark:text-[#888] leading-relaxed">
+                          {s.prompt.split(",").slice(0, 3).join(", ")}…
+                        </p>
+                      </div>
+                    ) : null;
+                  })()}
+
+                  {/* Step 3 — Theme Detail */}
+                  <div className="px-2 pt-1 pb-1 bg-slate-50 dark:bg-[#252525] border-y border-slate-200 dark:border-[#333]">
+                    <span className="text-[8px] font-bold uppercase tracking-widest text-slate-400 dark:text-[#666]">
+                      3 — Theme / Detail (optional)
+                    </span>
                   </div>
                   <div className="px-2 py-2 flex flex-col gap-1.5">
-                    <p className="text-[9px] text-slate-500 dark:text-[#888] leading-relaxed">
-                      อธิบายบรรยากาศ / สถานที่ / สไตล์ที่ต้องการ
-                    </p>
                     <textarea
                       value={aiThemeText}
-                      onChange={e => setAiThemeText(e.target.value)}
-                      placeholder="เช่น: ninja village in feudal Japan, cherry blossom trees, lanterns, night time, moonlight..."
-                      rows={4}
+                      onChange={(e) => setAiThemeText(e.target.value)}
+                      placeholder="เช่น: ninja village in feudal Japan, cherry blossom, lanterns, night..."
+                      rows={3}
                       className="w-full text-[9px] p-2 rounded-lg border border-slate-200 dark:border-[#444] bg-white dark:bg-[#1a1a1a] text-slate-700 dark:text-[#d4d4d4] placeholder-slate-300 dark:placeholder-[#555] resize-none focus:outline-none focus:ring-1 focus:ring-indigo-400 dark:focus:ring-[#6060cc] leading-relaxed"
                     />
                   </div>
 
-                  {/* Step 3 — Prompt */}
+                  {/* Step 4 — Copy Prompt */}
                   <div className="px-2 pt-1 pb-1 bg-slate-50 dark:bg-[#252525] border-y border-slate-200 dark:border-[#333]">
-                    <span className="text-[8px] font-bold uppercase tracking-widest text-slate-400 dark:text-[#666]">ขั้นตอนที่ 3 — Copy Prompt</span>
+                    <span className="text-[8px] font-bold uppercase tracking-widest text-slate-400 dark:text-[#666]">
+                      4 — Copy Prompt → AI
+                    </span>
                   </div>
                   <div className="px-2 py-2 flex flex-col gap-1.5">
-                    <p className="text-[9px] text-slate-500 dark:text-[#888] leading-relaxed">
-                      Copy prompt + แนบภาพ reference ไป AI เช่น Midjourney, DALL·E, Ideogram
-                    </p>
-                    <pre className="text-[8px] bg-slate-50 dark:bg-[#1a1a1a] border border-slate-200 dark:border-[#333] rounded-lg p-2 text-slate-600 dark:text-[#aaa] whitespace-pre-wrap leading-relaxed font-mono max-h-48 overflow-y-auto">
+                    <pre className="text-[8px] bg-slate-50 dark:bg-[#1a1a1a] border border-slate-200 dark:border-[#333] rounded-lg p-2 text-slate-600 dark:text-[#aaa] whitespace-pre-wrap leading-relaxed font-mono max-h-32 overflow-y-auto">
                       {buildAiPrompt()}
                     </pre>
                     <button
@@ -2636,7 +3014,15 @@ ${detail}`;
                           : "bg-violet-50 dark:bg-[#1e1a3a] border-violet-200 dark:border-[#4a3a6a] text-violet-600 dark:text-[#b080ff] hover:bg-violet-100 dark:hover:bg-[#28224a]"
                       }`}
                     >
-                      {aiPromptCopied ? <><Check className="w-3.5 h-3.5" /> Copied!</> : <><Copy className="w-3.5 h-3.5" /> Copy Prompt</>}
+                      {aiPromptCopied ? (
+                        <>
+                          <Check className="w-3.5 h-3.5" /> Copied!
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" /> Copy Prompt
+                        </>
+                      )}
                     </button>
                     {!aiCaptureUrl && (
                       <p className="text-[8px] text-amber-500 dark:text-[#fbbf24] text-center">
@@ -2644,7 +3030,6 @@ ${detail}`;
                       </p>
                     )}
                   </div>
-
                 </div>
               )}
 
@@ -2653,12 +3038,19 @@ ${detail}`;
 
         </aside>
 
-        {/* Playfield Container - Centered exactly 1024x1024px Canvas */}
-        <div className="flex-1 flex items-center justify-center p-6 overflow-auto bg-slate-100 dark:bg-slate-950">
-          
-          {/* Exact 1024x1024 Card Container */}
-          <div className="w-[1024px] h-[1024px] border-4 border-slate-300 dark:border-slate-800/80 rounded-[40px] overflow-hidden bg-slate-200 dark:bg-slate-900 shadow-2xl relative shrink-0">
-            
+        {/* Playfield Container - responsive square canvas (auto-fit + zoom) */}
+        <div
+          ref={playfieldRef}
+          className="flex-1 flex items-center justify-center p-6 overflow-auto bg-slate-100 dark:bg-slate-950"
+        >
+
+          {/* Square Card Container — size driven by displaySize (fit × zoom) */}
+          <div
+            ref={cardRef}
+            style={{ width: displaySize, height: displaySize }}
+            className="border-4 border-slate-300 dark:border-slate-800/80 rounded-[40px] overflow-hidden bg-slate-200 dark:bg-slate-900 shadow-2xl relative shrink-0"
+          >
+
             {/* Three.js Canvas mount container */}
             <div
               ref={mountRef}
@@ -2671,6 +3063,23 @@ ${detail}`;
         </div>
       </main>
 
+      {/* ── Bottom Asset Panel ── */}
+      <AssetPanel
+        selectedMascot={selectedMascot}
+        onSelectModel={(item) => {
+          dynamicRegistryRef.current[item.id] = {
+            modelPath: item.modelPath,
+            name: item.name,
+            previewPath: item.previewPath,
+          };
+          setSelectedMascot(item.id);
+          switchPanel("characters");
+          setActiveTab("characters");
+        }}
+        onCancelSelect={() => setSelectedMascot(null)}
+      />
+
+      </div>
     </div>
   );
 }
