@@ -16,6 +16,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import ModelThumbnail from "./ModelThumbnail";
+import Dropdown3D from "./Dropdown3D";
 
 export interface AssetItem {
   id: string;
@@ -283,23 +284,44 @@ const COLLECTIONS: Collection[] = [
 const BRICK_STYLES = ["All", "Bevel", "None", "Round", "Square"] as const;
 type BrickStyle = (typeof BRICK_STYLES)[number];
 
-interface AssetPanelProps {
+export interface AssetPanelProps {
   selectedMascot: string | null;
   onSelectModel: (item: AssetItem) => void;
   onCancelSelect: () => void;
+  collapsed?: boolean;
+  onToggleCollapse?: (v: boolean) => void;
 }
 
 export default function AssetPanel({
   selectedMascot,
   onSelectModel,
   onCancelSelect,
+  collapsed: propsCollapsed,
+  onToggleCollapse,
 }: AssetPanelProps) {
+  const [internalCollapsed, setInternalCollapsed] = useState(false);
+  const collapsed = propsCollapsed !== undefined ? propsCollapsed : internalCollapsed;
+  const setCollapsed = (v: boolean | ((v: boolean) => boolean)) => {
+    const next = typeof v === 'function' ? v(collapsed) : v;
+    if (onToggleCollapse) onToggleCollapse(next);
+    else setInternalCollapsed(next);
+  };
   const [activeCollection, setActiveCollection] = useState("blocky");
-  const [collapsed, setCollapsed] = useState(false);
   const [search, setSearch] = useState("");
   const [brickStyle, setBrickStyle] = useState<BrickStyle>("Bevel");
 
   const collection = COLLECTIONS.find((c) => c.id === activeCollection)!;
+
+  const dropdownOptions = useMemo(() => {
+    return COLLECTIONS.map((col) => {
+      const IconComp = col.icon;
+      return {
+        label: `${col.label} (${col.items.length})`,
+        value: col.id,
+        icon: <IconComp className="w-3.5 h-3.5" style={{ color: col.color }} />,
+      };
+    });
+  }, []);
 
   const filteredItems = useMemo(() => {
     let items = collection.items;
@@ -324,54 +346,35 @@ export default function AssetPanel({
   return (
     <div
       className={`w-full shrink-0 bg-white dark:bg-[#1a1a1a] border-t-2 border-slate-200 dark:border-[#2e2e2e] flex flex-col select-none transition-all duration-200 ${
-        collapsed ? "h-10" : "h-56"
+        collapsed ? "h-10 overflow-hidden" : "h-auto"
       }`}
     >
-      {/* Top bar: collection tabs + collapse button */}
-      <div className="h-10 shrink-0 flex items-stretch border-b border-slate-200 dark:border-[#2e2e2e] bg-slate-50 dark:bg-[#222] overflow-x-auto">
-        <div className="flex items-stretch gap-0 flex-1 min-w-0">
-          {COLLECTIONS.map((col) => {
-            const active = activeCollection === col.id;
-            return (
-              <button
-                key={col.id}
-                onClick={() => {
-                  setActiveCollection(col.id);
-                  setSearch("");
-                }}
-                className={`flex items-center gap-1.5 px-3 py-1 text-[10px] font-bold whitespace-nowrap border-r border-slate-200 dark:border-[#2e2e2e] transition-colors cursor-pointer shrink-0 ${
-                  active
-                    ? "bg-white dark:bg-[#1a1a1a] text-slate-800 dark:text-slate-100 border-b-2 border-b-[var(--col-color)]"
-                    : "text-slate-400 dark:text-[#666] hover:text-slate-600 dark:hover:text-[#aaa] hover:bg-white/60 dark:hover:bg-[#232323]"
-                }`}
-                style={active ? ({ "--col-color": col.color } as React.CSSProperties) : undefined}
-              >
-                <col.icon className="w-3 h-3" />
-                <span>{col.label}</span>
-                <span
-                  className="text-[8px] px-1 rounded-full"
-                  style={{
-                    background: active ? col.color + "22" : undefined,
-                    color: active ? col.color : undefined,
-                  }}
-                >
-                  {col.items.length}
-                </span>
-              </button>
-            );
-          })}
+      {/* Top bar: collection dropdown + collapse button */}
+      <div className="h-10 shrink-0 flex items-center justify-between border-b border-slate-200 dark:border-[#2e2e2e] bg-slate-50 dark:bg-[#222] px-2">
+        
+        <div className="flex items-center gap-1.5 flex-1 min-w-0 pr-1 py-1">
+          <Dropdown3D
+            options={dropdownOptions}
+            value={activeCollection}
+            onChange={(val) => {
+              setActiveCollection(val);
+              setSearch("");
+            }}
+            size="sm"
+            className="w-full max-w-[220px]"
+          />
         </div>
 
         {/* Search */}
         {!collapsed && (
-          <div className="flex items-center gap-1 px-2 border-l border-slate-200 dark:border-[#2e2e2e] shrink-0">
+          <div className="flex items-center gap-1 px-1.5 border-l border-slate-200 dark:border-[#2e2e2e] shrink-0">
             <Search className="w-3 h-3 text-slate-400 dark:text-[#555]" />
             <input
               type="text"
               placeholder="ค้นหา..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="w-28 bg-transparent text-[10px] text-slate-700 dark:text-slate-300 outline-none placeholder-slate-400 dark:placeholder-[#555]"
+              className="w-16 bg-transparent text-[10px] text-slate-700 dark:text-slate-300 outline-none placeholder-slate-400 dark:placeholder-[#555]"
             />
           </div>
         )}
@@ -392,7 +395,7 @@ export default function AssetPanel({
 
       {/* Content */}
       {!collapsed && (
-        <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+        <div className="flex flex-col">
           {/* Brick-kit style sub-filter */}
           {activeCollection === "brick-kit" && (
             <div className="flex items-center gap-1 px-3 py-1.5 border-b border-slate-100 dark:border-[#2a2a2a] shrink-0">
@@ -434,8 +437,7 @@ export default function AssetPanel({
           )}
 
           {/* Model grid */}
-          <div className="flex-1 overflow-y-auto overflow-x-hidden">
-            <div className="grid p-2 gap-1.5" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(72px, 1fr))" }}>
+          <div className="p-2 gap-1.5" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(72px, 1fr))" }}>
               {filteredItems.map((item) => {
                 const isSelected = selectedMascot === item.id;
                 return (
@@ -478,7 +480,6 @@ export default function AssetPanel({
                   ไม่พบ model
                 </div>
               )}
-            </div>
           </div>
         </div>
       )}
