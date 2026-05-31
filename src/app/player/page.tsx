@@ -397,6 +397,15 @@ export default function PlayerPage() {
   // Cache to store loaded GLB models dynamically to prevent network refetches
   const loadedModelsRef = useRef<{ [mascotId: string]: THREE.Group }>({});
 
+  // Cache to store measured unscaled visual dimensions of loaded models to prevent CPU overhead
+  const mascotBoundsCacheRef = useRef<{
+    [mascotId: string]: {
+      size: THREE.Vector3;
+      center: THREE.Vector3;
+      minY: number;
+    }
+  }>({});
+
   // Dynamic registry for models from non-MASCOTS collections (id → { modelPath, name, previewPath? })
   const dynamicRegistryRef = useRef<Record<string, { modelPath: string; name: string; previewPath?: string }>>({});
 
@@ -405,6 +414,7 @@ export default function PlayerPage() {
 
   // Cache to store loaded GLB animation clips per mascotId
   const loadedAnimsRef = useRef<{ [mascotId: string]: THREE.AnimationClip[] }>({});
+  const [loadedAnims, setLoadedAnims] = useState<{ [mascotId: string]: THREE.AnimationClip[] }>({});
 
   // Active AnimationMixers indexed by character id
   const mixersRef = useRef<{ [charId: string]: AnimationMixer }>({});
@@ -432,6 +442,7 @@ export default function PlayerPage() {
   // Renderer ref for scene capture
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const forceRenderRef = useRef(false);
+  const requestFrameRef = useRef<(() => void) | null>(null);
 
   // Light refs for dynamic intensity/position updates
   const ambientLightRef = useRef<THREE.AmbientLight | null>(null);
@@ -993,6 +1004,7 @@ export default function PlayerPage() {
         // Cache animation clips from this GLB
         if (gltf.animations && gltf.animations.length > 0) {
           loadedAnimsRef.current[mascotId] = gltf.animations;
+          setLoadedAnims(prev => ({ ...prev, [mascotId]: gltf.animations }));
         }
         setLoadedMascotIds(prev => {
           if (prev.includes(mascotId)) return prev;
@@ -2291,6 +2303,7 @@ export default function PlayerPage() {
           hoverTileRef.current.visible = false;
         }
       }
+      requestFrame();
     };
 
     const handleMouseUp = () => {
@@ -2310,6 +2323,7 @@ export default function PlayerPage() {
       isDraggingGizmo = false;
       isDraggingCharRef.current = false;
       activeGizmoAxis = null;
+      requestFrame();
     };
 
     const handleContextMenu = (e: MouseEvent) => {
@@ -2453,20 +2467,30 @@ export default function PlayerPage() {
               charActions[returnClip].setEffectiveWeight(1).reset().fadeIn(0.25).play();
               activeAnimNameRef.current[charId] = returnClip;
             }
+            requestFrame();
           }, 400);
         }
       }
+      requestFrame();
     };
 
     window.addEventListener("keydown", handleKeyDown);
 
     let lastTime = performance.now();
-    let animFrameId: number;
+    let animFrameId: number | null = null;
     let lastOrbitRad = -999;
     let lastGridX = -999, lastGridY = -999, lastGridZ = -999;
     let lastAmbient = -1, lastRim = -1, lastSun = -1, lastSunAz = -1, lastSunEl = -1;
+
+    const requestFrame = () => {
+      if (animFrameId === null) {
+        animFrameId = requestAnimationFrame(render);
+      }
+    };
+    requestFrameRef.current = requestFrame;
+
     const render = () => {
-      animFrameId = requestAnimationFrame(render);
+      animFrameId = null;
 
       const now = performance.now();
       const delta = (now - lastTime) / 1000;
@@ -2966,13 +2990,15 @@ export default function PlayerPage() {
         leafPosAttr.needsUpdate = true;
       }
 
-      if (!needsRender) return;
-      renderer.render(scene, camera);
+      if (needsRender) {
+        renderer.render(scene, camera);
+        requestFrame();
+      }
     };
-    render();
+    requestFrame();
 
     return () => {
-      cancelAnimationFrame(animFrameId);
+      if (animFrameId !== null) cancelAnimationFrame(animFrameId);
       
       domElement.removeEventListener("mousedown", handleMouseDown);
       window.removeEventListener("mousemove", handleMouseMove);
@@ -3109,50 +3135,84 @@ export default function PlayerPage() {
     const tileGeo = tileGeoRef.current;
     const edgeGeo = edgeGeoRef.current;
 
-    // Build the grid meshes using shared reusable geometries
+    // Calculate how many tiles alternate for Material A and B
+    let countA = 0;
+    let countB = 0;
     for (let x = 0; x < GRID_SIZE; x++) {
       for (let z = 0; z < GRID_SIZE; z++) {
-        const tileContainer = new THREE.Group();
-        tileContainer.name = `tile_${x}_${z}`;
-        tileContainer.userData = { gridX: x, gridZ: z };
-        gridGroup.add(tileContainer);
-
-        // alternating pattern
-        const mat = (x + z) % 2 === 0 ? tileMatARef.current! : tileMatBRef.current!;
-        const topMesh = new THREE.Mesh(tileGeo, mat);
-        topMesh.position.y = 0.01;
-        topMesh.receiveShadow = false;
-        topMesh.castShadow = false;
-        tileContainer.add(topMesh);
-
-        // wireframe edges
-        const edges = new THREE.LineSegments(edgeGeo, lineMatRef.current!);
-        edges.position.y = 0.01;
-        tileContainer.add(edges);
-
-        // bottom base block
-        const bottomMesh = new THREE.Mesh(
-          new THREE.BoxGeometry(1.0, 0.02, 1.0),
-          tileBottomMatRef.current!
-        );
-        bottomMesh.position.y = -0.01;
-        tileContainer.add(bottomMesh);
+        if ((x + z) % 2 === 0) countA++;
+        else countB++;
       }
     }
 
-    // Set static positions for tiles
-    let idx = 0;
+    // InstancedMesh for Top Blocks
+    const instancedMeshA = new THREE.InstancedMesh(tileGeo, tileMatARef.current!, countA);
+    instancedMeshA.name = "grid_tiles_a";
+    const instancedMeshB = new THREE.InstancedMesh(tileGeo, tileMatBRef.current!, countB);
+    instancedMeshB.name = "grid_tiles_b";
+    
+    // InstancedMesh for Bottom Blocks (reusing tileGeo BoxGeometry!)
+    const instancedMeshBottom = new THREE.InstancedMesh(tileGeo, tileBottomMatRef.current!, GRID_SIZE * GRID_SIZE);
+    instancedMeshBottom.name = "grid_tiles_bottom";
+
+    const dummy = new THREE.Object3D();
+    let idxA = 0;
+    let idxB = 0;
+    let idxBottom = 0;
+
+    // We also merge all wireframe line segments into a single BufferGeometry
+    const edgePosAttr = edgeGeo.getAttribute("position") as THREE.BufferAttribute;
+    const edgeVal = edgePosAttr.array;
+    const ptsPerTile = edgeVal.length;
+    const mergedLinePositions = new Float32Array(GRID_SIZE * GRID_SIZE * ptsPerTile);
+    let lineOffset = 0;
+
     for (let x = 0; x < GRID_SIZE; x++) {
       for (let z = 0; z < GRID_SIZE; z++) {
-        const tileContainer = gridGroup.children[idx] as THREE.Group;
-        if (tileContainer) {
-          const worldX = (x - (GRID_SIZE - 1) / 2) * TILE_SPACING;
-          const worldZ = (z - (GRID_SIZE - 1) / 2) * TILE_SPACING;
-          tileContainer.position.set(worldX, 0, worldZ);
+        const worldX = (x - (GRID_SIZE - 1) / 2) * TILE_SPACING;
+        const worldZ = (z - (GRID_SIZE - 1) / 2) * TILE_SPACING;
+
+        // Top mesh
+        dummy.position.set(worldX, 0.01, worldZ);
+        dummy.updateMatrix();
+        if ((x + z) % 2 === 0) {
+          instancedMeshA.setMatrixAt(idxA, dummy.matrix);
+          idxA++;
+        } else {
+          instancedMeshB.setMatrixAt(idxB, dummy.matrix);
+          idxB++;
         }
-        idx++;
+
+        // Bottom block mesh (reusing top tile geometry)
+        dummy.position.set(worldX, -0.01, worldZ);
+        dummy.updateMatrix();
+        instancedMeshBottom.setMatrixAt(idxBottom, dummy.matrix);
+        idxBottom++;
+
+        // Line wireframes
+        for (let k = 0; k < ptsPerTile; k += 3) {
+          mergedLinePositions[lineOffset + k] = edgeVal[k] + worldX;
+          mergedLinePositions[lineOffset + k + 1] = edgeVal[k + 1] + 0.01;
+          mergedLinePositions[lineOffset + k + 2] = edgeVal[k + 2] + worldZ;
+        }
+        lineOffset += ptsPerTile;
       }
     }
+
+    instancedMeshA.instanceMatrix.needsUpdate = true;
+    instancedMeshB.instanceMatrix.needsUpdate = true;
+    instancedMeshBottom.instanceMatrix.needsUpdate = true;
+
+    gridGroup.add(instancedMeshA);
+    gridGroup.add(instancedMeshB);
+    gridGroup.add(instancedMeshBottom);
+
+    // Single merged LinesSegments mesh
+    const mergedEdgeGeo = new THREE.BufferGeometry();
+    mergedEdgeGeo.setAttribute("position", new THREE.BufferAttribute(mergedLinePositions, 3));
+    const mergedLines = new THREE.LineSegments(mergedEdgeGeo, lineMatRef.current!);
+    mergedLines.name = "grid_lines";
+    gridGroup.add(mergedLines);
 
     // Dynamic high-fidelity 3D direction cards placed neatly flat on the ground aligned with grid perspective
     const dirs = [
@@ -3189,6 +3249,9 @@ export default function PlayerPage() {
       }
     });
 
+    // Wake up render loop if on-demand rendering is enabled
+    forceRenderRef.current = true;
+    requestFrameRef.current?.();
   }, [gridResolution]);
 
   // Effect to sync placed GLTF model characters inside the separate characterGroup dynamically
@@ -3246,41 +3309,23 @@ export default function PlayerPage() {
 
     // Helper to calculate robust bounding box even if setFromObject fails on un-added skinned meshes
     const computeModelBounds = (model: THREE.Group) => {
-      let minX = Infinity, minY = Infinity, minZ = Infinity;
-      let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+      // Force local matrix updates so child transforms are correctly updated before measuring
+      model.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(model);
       
-      model.traverse((child) => {
-        if ((child as THREE.Mesh).isMesh) {
-          const geom = (child as THREE.Mesh).geometry;
-          if (geom) {
-            if (!geom.boundingBox) geom.computeBoundingBox();
-            const b = geom.boundingBox;
-            if (b && isFinite(b.min.x) && isFinite(b.max.x)) {
-              minX = Math.min(minX, b.min.x);
-              minY = Math.min(minY, b.min.y);
-              minZ = Math.min(minZ, b.min.z);
-              maxX = Math.max(maxX, b.max.x);
-              maxY = Math.max(maxY, b.max.y);
-              maxZ = Math.max(maxZ, b.max.z);
-            }
-          }
-        }
-      });
-
-      // Fallback to approximate dimensions if bounding box calculation failed
-      if (minX === Infinity || maxX === -Infinity || Math.abs(maxX - minX) < 1e-4) {
+      if (isFinite(box.min.x) && isFinite(box.max.x)) {
         return {
-          box: new THREE.Box3(new THREE.Vector3(-0.3, 0.0, -0.3), new THREE.Vector3(0.3, 1.5, 0.3)),
-          size: new THREE.Vector3(0.6, 1.5, 0.6),
-          center: new THREE.Vector3(0, 0.75, 0)
+          size: box.getSize(new THREE.Vector3()),
+          center: box.getCenter(new THREE.Vector3()),
+          minY: box.min.y
         };
       }
 
-      const box = new THREE.Box3(new THREE.Vector3(minX, minY, minZ), new THREE.Vector3(maxX, maxY, maxZ));
+      // Fallback to approximate dimensions if bounding box calculation failed
       return {
-        box,
-        size: box.getSize(new THREE.Vector3()),
-        center: box.getCenter(new THREE.Vector3())
+        size: new THREE.Vector3(0.6, 1.5, 0.6),
+        center: new THREE.Vector3(0, 0.75, 0),
+        minY: 0
       };
     };
 
@@ -3353,54 +3398,28 @@ export default function PlayerPage() {
 
         charGroup.add(wrapper);
 
-        // 3. Force world matrix update so Three.js computes final world coordinates
-        wrapper.updateMatrixWorld(true);
-
-        // 4. Measure correct world visual bounds using setFromObject (which handles all child meshes and scales perfectly!)
-        const visualBox = new THREE.Box3().setFromObject(wrapper);
-        if (isFinite(visualBox.min.x) && isFinite(visualBox.max.x)) {
-          const visualSize = visualBox.getSize(new THREE.Vector3());
-          const visualCenter = visualBox.getCenter(new THREE.Vector3());
-
-          // Calculate visual size in the unscaled local wrapper coordinates
-          const localSizeX = visualSize.x / (char.scaleX * s);
-          const localSizeZ = visualSize.z / (char.scaleZ * s);
-          const localSizeY = visualSize.y / (char.scaleY * s);
-          
-          const baseSize = Math.max(localSizeX, localSizeZ);
-          
-          // Compute correct scale factor to make the base footprint exactly 1.0 local Grid unit
-          const scaleFactor = 1.0 / (baseSize || 1.0);
-          
-          // Apply scale to modelClone
-          modelClone.scale.set(scaleFactor, scaleFactor, scaleFactor);
-
-          // Update matrix again to apply the new local scale
-          wrapper.updateMatrixWorld(true);
-          
-          // Measure the new bounding box after scaling
-          const finalBox = new THREE.Box3().setFromObject(wrapper);
-          const finalCenter = finalBox.getCenter(new THREE.Vector3());
-          const finalSize = finalBox.getSize(new THREE.Vector3());
-          
-          // Center the visual model precisely on the grid tile and rest flat on the ground Y surface level
-          const diffX = finalCenter.x - posX;
-          const diffZ = finalCenter.z - posZ;
-          modelClone.position.x -= diffX / (char.scaleX * s);
-          modelClone.position.z -= diffZ / (char.scaleZ * s);
-
-          const diffY = finalBox.min.y - posY;
-          modelClone.position.y -= diffY / (char.scaleY * s);
-
-          // Update helper cylinder to match the final calculated visual height!
-          const visualHeight = finalSize.y / (char.scaleY * s);
-          raycastHelper.scale.set(1.0, visualHeight / 1.5, 1.0);
-          raycastHelper.position.y = visualHeight / 2;
-        } else {
-          // Fallback if visual bounding box is empty/invalid
-          modelClone.scale.set(1.0, 1.0, 1.0);
-          modelClone.position.set(0, 0, 0);
+        // 3. Retrieve or calculate measured visual dimensions from cache
+        let bounds = mascotBoundsCacheRef.current[char.mascotId];
+        if (!bounds) {
+          bounds = computeModelBounds(baseModel);
+          mascotBoundsCacheRef.current[char.mascotId] = bounds;
         }
+
+        const baseSize = Math.max(bounds.size.x, bounds.size.z);
+        
+        // Compute correct scale factor to make the base footprint exactly 1.0 local Grid unit
+        const scaleFactor = 1.0 / (baseSize || 1.0);
+        
+        // Apply scale and mathematical closed-form centering/resting offsets
+        modelClone.scale.set(scaleFactor, scaleFactor, scaleFactor);
+        modelClone.position.x = -bounds.center.x * scaleFactor;
+        modelClone.position.z = -bounds.center.z * scaleFactor;
+        modelClone.position.y = -bounds.minY * scaleFactor;
+
+        // Update helper cylinder to match the final calculated visual height!
+        const visualHeight = bounds.size.y * scaleFactor;
+        raycastHelper.scale.set(1.0, visualHeight / 1.5, 1.0);
+        raycastHelper.position.y = visualHeight / 2;
 
         // 5. Setup AnimationMixer and pre-create all actions for every clip
         const clips = loadedAnimsRef.current[char.mascotId];
@@ -3455,6 +3474,36 @@ export default function PlayerPage() {
   // Only re-run when characters are added/removed or models finish loading or grid resolution changes.
   // gridPos and gridScale are NOT deps because the render loop repositions characters every frame.
   }, [placedCharacters, loadedMascotIds, gridResolution]);
+
+  // Effect to wake up the Three.js render loop when key states or settings change
+  useEffect(() => {
+    forceRenderRef.current = true;
+    requestFrameRef.current?.();
+  }, [
+    gridPos,
+    gridScale,
+    gridOpacity,
+    gridLineOpacity,
+    gridResolution,
+    gridVisible,
+    cameraOrbitDeg,
+    ambientIntensity,
+    sunIntensity,
+    sunAzimuth,
+    sunElevation,
+    rimIntensity,
+    weatherEffect,
+    weatherSpeed,
+    weatherDensity,
+    weatherOpacity,
+    zoom,
+    isLiveMode,
+    selectedCharId,
+    placedCharacters,
+    blockedTiles,
+    finishTiles,
+    startTile,
+  ]);
 
   // Effect to maintain selection outline — re-runs whenever selection or characters rebuild
   useEffect(() => {
@@ -5063,7 +5112,7 @@ ${detail}`;
                     </div>
                     {!animationsCollapsed && (
                       <div className="px-3 py-2 flex flex-col gap-1">
-                        {(loadedAnimsRef.current[selectedChar.mascotId] ?? []).map(clip => (
+                        {(loadedAnims[selectedChar.mascotId] ?? []).map(clip => (
                           <button
                             key={clip.name}
                             onClick={() => switchCharAnim(selectedChar.id, clip.name)}
@@ -5076,7 +5125,7 @@ ${detail}`;
                             {clip.name}
                           </button>
                         ))}
-                        {(loadedAnimsRef.current[selectedChar.mascotId] ?? []).length === 0 && (
+                        {(loadedAnims[selectedChar.mascotId] ?? []).length === 0 && (
                           <p className="text-[8px] text-slate-400 dark:text-[#555]">ไม่มี animation</p>
                         )}
                       </div>
