@@ -12,6 +12,7 @@ import {
   Maximize2,
   MousePointer,
   Maximize,
+  Minimize,
   ChevronRight,
   ChevronLeft,
   ChevronDown,
@@ -38,7 +39,9 @@ import {
   Volume2,
   VolumeX,
   Zap,
-  ZapOff
+  ZapOff,
+  Cloud,
+  CloudSun
 } from "lucide-react";
 import Button3D from "@/components/game/Button3D";
 import AssetPanel, { AssetItem } from "@/components/game/AssetPanel";
@@ -349,6 +352,11 @@ export default function PlayerPage() {
   const [tileEditMode, setTileEditMode] = useState<"paint" | "finish" | "start">("paint");
   const [isLiveMode, setIsLiveMode] = useState(false);
   const [hasWon, setHasWon] = useState(false);
+  // Live display: "fit" = letterbox (reproduce editor frame, blurred margins),
+  // "fill" = fullscreen (grid + BG scale up together to cover the window).
+  const [liveDisplayMode, setLiveDisplayMode] = useState<"fit" | "fill">("fit");
+  // Box dimensions of the centered scene in "fit" mode (drives the sharp BG box).
+  const [liveBox, setLiveBox] = useState({ w: 0, h: 0 });
 
   // Selection outline materials ref (for pulsing animation in render loop)
   const outlineMatsRef = useRef<THREE.MeshBasicMaterial[]>([]);
@@ -414,6 +422,7 @@ export default function PlayerPage() {
   const startTileRef = useRef<string | null>(null);
   const tileEditModeRef = useRef<"paint" | "finish" | "start">("paint");
   const isLiveModeRef = useRef(false);
+  const liveDisplayModeRef = useRef<"fit" | "fill">("fit");
   const hasWonRef = useRef(false);
   const finishOverlayGroupRef = useRef<THREE.Group | null>(null);
   const finishOverlayGeoRef = useRef<THREE.PlaneGeometry | null>(null);
@@ -497,6 +506,21 @@ export default function PlayerPage() {
   const [weatherSpeed, setWeatherSpeed] = useState<number>(1.0);
   const [weatherDensity, setWeatherDensity] = useState<number>(150);
   const [weatherOpacity, setWeatherOpacity] = useState<number>(0.6);
+  const [lastActiveWeatherEffect, setLastActiveWeatherEffect] = useState<"gentle" | "windy" | "dreamy" | "storm">("gentle");
+
+  useEffect(() => {
+    if (weatherEffect !== "none") {
+      setLastActiveWeatherEffect(weatherEffect);
+    }
+  }, [weatherEffect]);
+
+  const toggleWeather = () => {
+    if (weatherEffect !== "none") {
+      setWeatherEffect("none");
+    } else {
+      setWeatherEffect(lastActiveWeatherEffect);
+    }
+  };
 
   // Refs for rendering loop access
   const weatherEffectRef = useRef<"none" | "gentle" | "windy" | "dreamy" | "storm">("none");
@@ -732,6 +756,10 @@ export default function PlayerPage() {
   }, [selectedMascot]);
 
   useEffect(() => {
+    liveDisplayModeRef.current = liveDisplayMode;
+  }, [liveDisplayMode]);
+
+  useEffect(() => {
     selectedCharIdRef.current = selectedCharId;
   }, [selectedCharId]);
 
@@ -818,11 +846,88 @@ export default function PlayerPage() {
   };
 
 
+  // Resize the renderer + camera for the current live display mode. Called on
+  // entering live mode, on window resize, and when toggling fit/fill.
+  const applyLiveLayout = () => {
+    const r = rendererRef.current;
+    const cam = cameraRef.current;
+    if (!r || !cam) return;
+    // Measure the real editor card (its true on-screen size) rather than
+    // displaySizeRef, which can be stale/clamped and throws off the scale.
+    const rect = cardRef.current?.getBoundingClientRect();
+    const cardW = rect?.width || displayWRef.current;
+    const cardH = rect?.height || displaySizeRef.current;
+    const winW = window.innerWidth;
+    const winH = window.innerHeight;
+    const fs = frustumSizeRef.current;
+    const editorAspect = cardW / cardH;
+    r.setClearAlpha(0);
+
+    if (liveDisplayModeRef.current === "fill") {
+      // Fullscreen: render at the full window, then scale the grid up by the
+      // cover factor S so grid + BG grow together (px-per-unit = S × editor).
+      const S = Math.max(winW / cardW, winH / cardH);
+      r.setSize(winW, winH);
+      const fsFill = (fs * winH) / (S * cardH);
+      const aspect = winW / winH;
+      cam.left = -fsFill * aspect; cam.right = fsFill * aspect;
+      cam.top = fsFill; cam.bottom = -fsFill;
+    } else {
+      // Fit (letterbox): reproduce the editor frame larger, keeping the editor
+      // aspect + frustum so BG and grid stay locked exactly as in the editor.
+      const boxScale = Math.min(winW / cardW, winH / cardH);
+      const boxW = Math.round(cardW * boxScale);
+      const boxH = Math.round(cardH * boxScale);
+      r.setSize(boxW, boxH);
+      cam.left = -fs * editorAspect; cam.right = fs * editorAspect;
+      cam.top = fs; cam.bottom = -fs;
+      setLiveBox({ w: boxW, h: boxH });
+    }
+    cam.updateProjectionMatrix();
+    forceRenderRef.current = true;
+  };
+
+  const toggleLiveDisplayMode = () => {
+    const next = liveDisplayModeRef.current === "fit" ? "fill" : "fit";
+    liveDisplayModeRef.current = next;
+    setLiveDisplayMode(next);
+    applyLiveLayout();
+  };
+
+  // While live, keep the renderer/camera in sync with the window size.
+  useEffect(() => {
+    if (!isLiveMode) return;
+    const onResize = () => applyLiveLayout();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLiveMode]);
+
+  // Hide/show editor-only chrome (grid floor, direction arrows, gizmo, blocked
+  // overlay, selection helpers) so player mode shows only the BG + models.
+  const setLiveHelpersHidden = (hidden: boolean) => {
+    if (gridGroupRef.current) gridGroupRef.current.visible = hidden ? false : gridVisibleRef.current;
+    if (blockedOverlayGroupRef.current) blockedOverlayGroupRef.current.visible = !hidden;
+    if (finishOverlayGroupRef.current) finishOverlayGroupRef.current.visible = !hidden;
+    if (hidden) {
+      if (gizmoGroupRef.current) gizmoGroupRef.current.visible = false;
+      if (hoverTileRef.current) hoverTileRef.current.visible = false;
+      if (selectionRingRef.current) selectionRingRef.current.visible = false;
+      if (selectionGlowRef.current) selectionGlowRef.current.visible = false;
+      if (startOverlayRef.current) startOverlayRef.current.visible = false;
+      if (playerMarkerRef.current) playerMarkerRef.current.visible = false;
+    }
+  };
+
   const startLiveMode = () => {
     if (!playerCharId || finishTiles.size === 0) return;
     setHasWon(false);
     setSelectedMascot(null);
     setSelectedCharId(null);
+    // Update the ref synchronously so the render loop's live-mode guards apply
+    // on the very next frame (the effect-based sync lags by a render).
+    isLiveModeRef.current = true;
+    setLiveHelpersHidden(true);
     if (startTileRef.current) {
       const [sx, sz] = startTileRef.current.split("_").map(Number);
       setPlacedCharacters(prev => prev.map(c =>
@@ -831,24 +936,7 @@ export default function PlayerPage() {
       delete smoothTransformRef.current[playerCharId];
     }
     // Resize renderer immediately — before React re-render
-    {
-      const r = rendererRef.current;
-      const cam = cameraRef.current;
-      if (r && cam) {
-        r.setSize(window.innerWidth, window.innerHeight);
-        r.setClearAlpha(0);
-        // Maintain the same on-screen pixels-per-world-unit as editor mode.
-        // Measure the actual rendered card height (true display size) instead of
-        // displaySizeRef, which can be stale/clamped and throws off the scale.
-        const editorH = cardRef.current?.getBoundingClientRect().height || displaySizeRef.current;
-        const fs = frustumSizeRef.current * (window.innerHeight / editorH);
-        const aspect = window.innerWidth / window.innerHeight;
-        cam.left = -fs * aspect; cam.right = fs * aspect;
-        cam.top = fs; cam.bottom = -fs;
-        cam.updateProjectionMatrix();
-        forceRenderRef.current = true;
-      }
-    }
+    applyLiveLayout();
     setIsLiveMode(true);
   };
 
@@ -870,6 +958,8 @@ export default function PlayerPage() {
         forceRenderRef.current = true;
       }
     }
+    isLiveModeRef.current = false;
+    setLiveHelpersHidden(false);
     setIsLiveMode(false);
     setHasWon(false);
     setTileEditMode("paint");
@@ -990,6 +1080,9 @@ export default function PlayerPage() {
       setWeatherSpeed(snap.weather.speed ?? 1.0);
       setWeatherDensity(snap.weather.density ?? 150);
       setWeatherOpacity(snap.weather.opacity ?? 0.6);
+      if (snap.weather.effect && snap.weather.effect !== "none") {
+        setLastActiveWeatherEffect(snap.weather.effect);
+      }
     } else {
       setWeatherEffect("none");
       setWeatherSpeed(1.0);
@@ -2540,7 +2633,7 @@ export default function PlayerPage() {
           );
           startOverlayRef.current.scale.set(s, s, 1);
           (startOverlayRef.current.material as THREE.MeshBasicMaterial).opacity = 0.45 + 0.2 * Math.sin(now * 0.003);
-          startOverlayRef.current.visible = true;
+          startOverlayRef.current.visible = !isLiveModeRef.current;
         } else {
           startOverlayRef.current.visible = false;
         }
@@ -2586,7 +2679,7 @@ export default function PlayerPage() {
           );
           playerMarkerRef.current.rotation.y = now * 0.0015;
           playerMarkerRef.current.scale.setScalar(s);
-          playerMarkerRef.current.visible = true;
+          playerMarkerRef.current.visible = !isLiveModeRef.current;
         } else {
           playerMarkerRef.current.visible = false;
         }
@@ -2654,7 +2747,7 @@ export default function PlayerPage() {
 
       // Update Grid translation gizmo position, scale, and visibility dynamically
       if (gizmoGroupRef.current) {
-        if (activeTabRef.current === "grid") {
+        if (activeTabRef.current === "grid" && !isLiveModeRef.current) {
           const s = gridScaleRef.current;
           gizmoGroupRef.current.position.set(
             gridPosRef.current.x,
@@ -3939,6 +4032,19 @@ ${detail}`;
           )}
         </button>
 
+        {/* Weather Toggle (On/Off) */}
+        <button
+          onClick={toggleWeather}
+          className="w-10 h-10 rounded-xl bg-white dark:bg-[#252525] border-2 border-b-[4px] border-slate-200 dark:border-[#141414] flex items-center justify-center text-slate-500 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-[#2a2a2a] active:border-b-[2px] active:translate-y-[2px] transition-all duration-100 cursor-pointer shadow-sm"
+          title={weatherEffect !== "none" ? "ปิดสภาพอากาศ (Disable Weather)" : "เปิดสภาพอากาศ (Enable Weather)"}
+        >
+          {weatherEffect !== "none" ? (
+            <CloudSun className="w-5 h-5 text-brand-blue dark:text-[#569cd6] animate-pulse" />
+          ) : (
+            <Cloud className="w-5 h-5 text-slate-400 dark:text-[#666]" />
+          )}
+        </button>
+
         {/* Theme Switcher Toggle */}
         <button
           onClick={toggleTheme}
@@ -4494,7 +4600,28 @@ ${detail}`;
                   <div className="px-2 py-1 bg-slate-100 dark:bg-[#252525] border-t border-b border-slate-200 dark:border-[#333] text-slate-400 dark:text-[#888] text-[9px] uppercase tracking-widest font-bold mt-2">
                     สภาพอากาศ (Weather Effects)
                   </div>
-                  
+
+                  {/* Weather Toggle Switch */}
+                  <div className="flex items-center justify-between px-3 py-2 border-b border-slate-100 dark:border-[#2a2a2a] hover:bg-slate-50 dark:hover:bg-[#252525] transition-colors">
+                    <div className="flex flex-col">
+                      <span className="text-blue-500 dark:text-[#9cdcfe] text-[9px] font-bold">เปิดใช้งานสภาพอากาศ</span>
+                      <span className="text-slate-400 dark:text-[#666] text-[7.5px]">
+                        {weatherEffect !== "none" ? "กำลังแสดงเอฟเฟกต์สภาพอากาศ" : "ปิดการแสดงผลสภาพอากาศ"}
+                      </span>
+                    </div>
+                    <button
+                      onClick={toggleWeather}
+                      className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[9px] font-bold cursor-pointer transition-all ${
+                        weatherEffect !== "none"
+                          ? "bg-green-100 dark:bg-[#3a5a3a] text-green-700 dark:text-[#6dbe6d] hover:bg-green-200 dark:hover:bg-[#2f4d2f]"
+                          : "bg-slate-100 dark:bg-[#3a3a3a] text-slate-400 dark:text-[#888] hover:bg-slate-200 dark:hover:bg-[#444]"
+                      }`}
+                    >
+                      {weatherEffect !== "none" ? <CloudSun className="w-3.5 h-3.5 animate-pulse" /> : <Cloud className="w-3.5 h-3.5" />}
+                      {weatherEffect !== "none" ? "ON" : "OFF"}
+                    </button>
+                  </div>
+
                   {/* Preset Selector */}
                   <div className="p-2 grid grid-cols-2 gap-1.5 border-b border-slate-100 dark:border-[#2a2a2a]">
                     {[
@@ -4774,23 +4901,55 @@ ${detail}`;
             <div
               ref={mountRef}
               className={isLiveMode
-                ? "fixed inset-0 z-[100] visible"
+                ? "fixed inset-0 z-[100] visible flex items-center justify-center"
                 : "w-full h-full relative z-10 bg-transparent"}
             />
 
           </div>
 
-          {/* Live Mode background layer */}
-          {isLiveMode && (
+          {/* Live Mode background — Fill: single cover layer scaling with the grid */}
+          {isLiveMode && liveDisplayMode === "fill" && (
             <div
-              style={{ ...currentBgStyle }}
+              style={{ ...currentBgStyle, transform: `scale(${zoom})`, transformOrigin: "center center" }}
               className="fixed inset-0 z-[99] pointer-events-none"
             />
+          )}
+
+          {/* Live Mode background — Fit: blurred full-screen backdrop + sharp centered box */}
+          {isLiveMode && liveDisplayMode === "fit" && (
+            <>
+              <div
+                style={{ ...currentBgStyle, transform: "scale(1.1)", filter: "blur(32px) brightness(0.55)" }}
+                className="fixed inset-0 z-[98] pointer-events-none"
+              />
+              <div className="fixed inset-0 z-[99] flex items-center justify-center pointer-events-none">
+                <div
+                  style={{
+                    width: liveBox.w,
+                    height: liveBox.h,
+                    ...currentBgStyle,
+                    transform: `scale(${zoom})`,
+                    transformOrigin: "center center",
+                  }}
+                  className="overflow-hidden"
+                />
+              </div>
+            </>
           )}
 
           {/* Live Mode HUD overlay */}
           {isLiveMode && (
             <div className="fixed inset-0 z-[101] pointer-events-none">
+              {/* Fit / Fill toggle */}
+              <button
+                onClick={toggleLiveDisplayMode}
+                title={liveDisplayMode === "fit" ? "เต็มจอ (Fill screen)" : "พอดีเฟรม (Fit / letterbox)"}
+                className="absolute top-4 right-28 pointer-events-auto h-10 px-4 rounded-xl border-2 border-b-[4px] border-slate-600 border-b-slate-800 flex items-center gap-1.5 text-xs font-bold bg-slate-700 text-white hover:bg-slate-600 active:border-b-[2px] active:translate-y-[2px] transition-all duration-100 cursor-pointer shadow-lg"
+              >
+                {liveDisplayMode === "fit"
+                  ? <><Maximize className="w-4 h-4" /> Fill</>
+                  : <><Minimize className="w-4 h-4" /> Fit</>}
+              </button>
               {/* Stop button */}
               <button
                 onClick={stopLiveMode}
